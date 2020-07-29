@@ -25,13 +25,23 @@ import numpy as np
 # Imports for picking
 import peakutils
 
+# Add paths to my other modules
+import sys
+import os
+
+_home = os.path.expanduser("~") + "/"
+for d in os.listdir(_home + "git_repos"):
+    sys.path.append(_home + "git_repos/" + d)
+
+
 ######### personal helpers ##########
 # Specific to my data flow, maybe separate out to a different module
 
 
-def create_stream_tpc5(tpc5_path: str, stns: list, net="L0", chan="XHZ", hz=40e6):
+def create_stream_tpc5(tpc5_path: str, ord_stns: list, net="L0", chan="XHZ", hz=40e6):
     """
     Create an obspy Stream from a .tpc5 data file.
+    ord_stns must be the list of stations in the order they appear in the tpc5 file.
     """
     import h5py
     import tpc5
@@ -59,7 +69,7 @@ def create_stream_tpc5(tpc5_path: str, stns: list, net="L0", chan="XHZ", hz=40e6
     # input saved channels as chan_nums because the tpc5 has no info about which channels were saved
     # tpc5 channels will always start at 1 and increase monotonically
     for tr in range(ntr):
-        statn_stats = get_stats(stns[tr], net=net, chan=chan, hz=hz)
+        statn_stats = get_stats(ord_stns[tr], net=net, chan=chan, hz=hz)
 
         # iterate through continuous data segments
         # TranAX calls these Blocks, obspy calls them Traces
@@ -82,12 +92,14 @@ def create_stream_tpc5(tpc5_path: str, stns: list, net="L0", chan="XHZ", hz=40e6
     return source_stream
 
 
-def setup_experiment_from_dir(exp_name: str):
-    """Auto setup new ASDF file based on files in this directory."""
+def setup_experiment_from_dir(exp_name: str, glob_str="*.tpc5"):
+    """Auto setup new ASDF file based on files in this directory.
+    exp_name :: str name of experiment, will create exp_name.h5 file
+    glob_str :: limit data files read in by glob"""
     import glob
 
     # initialize dataset file
-    ds = LabDataSet(exp_name, compression="gzip-3")
+    ds = LabDataSet(exp_name + ".h5", compression="gzip-3")
     # find and add stations
     statxml_fp = glob.glob("*stations.xml")
     if not len(statxml_fp):
@@ -99,9 +111,11 @@ def setup_experiment_from_dir(exp_name: str):
     ds.add_local_locations(statxml_fp[0])
     # stat_locs and stns properties produced automatically now
     # find and add waveforms from tpc5 files
-    wf_files = glob.glob("*.tpc5")  # doesn't add full path prefix
+    wf_files = glob.glob(glob_str)  # doesn't add full path prefix
     ds.all_tags = []
+    print("Adding waveforms from: ")
     for wf in wf_files:
+        print(wf)
         tag = wf[:-5].lower()
         ds.add_waveforms(create_stream_tpc5(wf, ds.stns), tag)
     return ds
@@ -122,8 +136,10 @@ class LabDataSet(pyasdf.ASDFDataSet):
         inv = obspy.read_inventory(statxml_filepath, format="stationxml")
         nsta = len(inv[0].stations)
         stat_locs = {}
+        stats_order = [] # retain A1-D4 order with AExx station codes
         for sta in inv[0].stations:
             sta_code = sta.code
+            stats_order.append(sta_code)
             sta_loc = (
                 [
                     float(sta.extra.local_location.value[xyz].value)
@@ -137,7 +153,7 @@ class LabDataSet(pyasdf.ASDFDataSet):
         # add the local_locations as a dictionary to never worry about shuffling the stations and locations
         # data can't take a dictionary (and requires a shape), but parameters takes the dictionary just fine
         self.add_auxiliary_data(
-            data=np.array([]),
+            data=np.array(stats_order, dtype="S"),
             data_type="LabStationInfo",
             path="local_locations",
             parameters=stat_locs,
@@ -151,7 +167,7 @@ class LabDataSet(pyasdf.ASDFDataSet):
     @property
     def stns(self) -> list:
         """List of stations in the order of the stationxml file."""
-        return list(self.stat_locs.keys())
+        return list(np.char.decode(self.auxiliary_data.LabStationInfo.local_locations.data[:]))
 
     ######## picking methods of object ########
     def add_picks(self, tag, trace_num, picks):
@@ -204,7 +220,7 @@ class LabDataSet(pyasdf.ASDFDataSet):
                         x=np.array(old_picks[stn]) - view_from,
                         y=trc[old_picks[stn]],
                         mode="markers",
-                        marker={"symbol": "x", "color": "blue", "size": 15},
+                        marker={"symbol": "x", "color": "blue", "size": 10},
                     ),
                     int(plotkey[i][0]),
                     plotkey[i][1],
@@ -292,12 +308,12 @@ class LabDataSet(pyasdf.ASDFDataSet):
         return old_picks
 
     ######## source location on object ########
-    def locate_tag(self, tag, vp=0.272):
+    def locate_tag(self, tag, vp=0.272, bootstrap=False):
         """Locates all picked traces within a tag. vp in cm/s
         Assumes one pick per trace. TODO: fix that"""
         import scipy.optimize as opt
 
-        stns = self.stns  # TODO: necessary?
+        stns = self.stns
 
         def curve_func_cm(X, a, b, c):
             t = np.sqrt((X[0] - a) ** 2 + (X[1] - b) ** 2 + 3.85 ** 2) / vp - c
@@ -367,14 +383,18 @@ class LabDataSet(pyasdf.ASDFDataSet):
     def get_traces(self, tag, trace_num, pre=200, tot_len=2048):
         """Return a dict of short traces from a tag/trcnum based on picks."""
         traces = {}
-        picks = self.auxiliary_data.LabPicks[tag][f"tr{trace_num}"].parameters
+        picks = self.get_picks(tag, trace_num)
         for stn, pp in picks.items():
             if "L" in stn[:1]:
-                stn = stn[3:] # deal with existing picks having dumb station names
+                stn = stn[3:]  # deal with existing picks having dumb station names
             pp = pp[0]
             sl = slice(pp - pre, pp - pre + tot_len)
             traces[stn] = self.waveforms["L0_" + stn][tag][trace_num].data[sl]
         return traces
+
+    def get_picks(self, tag, trace_num):
+        """Shortcut to return the picks dictionary."""
+        return self.auxiliary_data.LabPicks[tag][f"tr{trace_num}"].parameters
 
 
 ######## picking helpers ########
