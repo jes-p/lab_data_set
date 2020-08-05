@@ -136,7 +136,7 @@ class LabDataSet(pyasdf.ASDFDataSet):
         inv = obspy.read_inventory(statxml_filepath, format="stationxml")
         nsta = len(inv[0].stations)
         stat_locs = {}
-        stats_order = [] # retain A1-D4 order with AExx station codes
+        stats_order = []  # retain A1-D4 order with AExx station codes
         for sta in inv[0].stations:
             sta_code = sta.code
             stats_order.append(sta_code)
@@ -167,7 +167,9 @@ class LabDataSet(pyasdf.ASDFDataSet):
     @property
     def stns(self) -> list:
         """List of stations in the order of the stationxml file."""
-        return list(np.char.decode(self.auxiliary_data.LabStationInfo.local_locations.data[:]))
+        return list(
+            np.char.decode(self.auxiliary_data.LabStationInfo.local_locations.data[:])
+        )
 
     ######## picking methods of object ########
     def add_picks(self, tag, trace_num, picks):
@@ -213,8 +215,8 @@ class LabDataSet(pyasdf.ASDFDataSet):
                 int(plotkey[i][0]),
                 plotkey[i][1],
             )
-            # plot existing picks, if any
-            if plot_op:
+            # plot existing picks, if any in window
+            if plot_op and old_picks[stn][0] > view_from:
                 fig.append_trace(
                     go.Scatter(
                         x=np.array(old_picks[stn]) - view_from,
@@ -225,18 +227,19 @@ class LabDataSet(pyasdf.ASDFDataSet):
                     int(plotkey[i][0]),
                     plotkey[i][1],
                 )
-            # plot new picks
-            fig.append_trace(
-                go.Scatter(
-                    x=np.array(new_picks[stn]) - view_from,
-                    y=trc[new_picks[stn]],
-                    mode="markers+text",
-                    text=[str(np) for np in range(len(new_picks[stn]))],
-                    textposition="bottom center",
-                ),
-                int(plotkey[i][0]),
-                plotkey[i][1],
-            )
+            # plot new picks, if any in window
+            if new_picks[stn][0] > view_from:
+                fig.append_trace(
+                    go.Scatter(
+                        x=np.array(new_picks[stn]) - view_from,
+                        y=trc[new_picks[stn]],
+                        mode="markers+text",
+                        text=[str(np) for np in range(len(new_picks[stn]))],
+                        textposition="bottom center",
+                    ),
+                    int(plotkey[i][0]),
+                    plotkey[i][1],
+                )
         # plot the figure
         fig["layout"].update(showlegend=False)
         fig.write_html(figname + ".html")
