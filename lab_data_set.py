@@ -25,6 +25,9 @@ import numpy as np
 # Imports for picking
 import peakutils
 
+# Import for parsing inputs (pick_all_near)
+import re
+
 # Add paths to my other modules
 import sys
 import os
@@ -191,14 +194,15 @@ class LabDataSet(pyasdf.ASDFDataSet):
         return old_picks
 
     def plot_picks(
-        self, tag, trace_num, view_from, view_len, new_picks, figname="picks_plot"
+        self, tag, trace_num, view_mid, view_len, new_picks, figname="picks_plot"
     ):
         """Produce an interactive plot of traces with numbered picks, and existing picks if present.
         Assumes 16 sensors.
         TODO: old_picks markers are too big"""
         fig, plotkey = subplts(4, 4)
+        start,stop = [int(view_mid - view_len/2), int(view_mid + view_len/2)]
 
-        # are there existing picks to view_len?
+        # are there existing picks?
         try:
             old_picks = self.auxiliary_data.LabPicks[tag][f"tr{trace_num}"].parameters
             plot_op = 1
@@ -210,16 +214,16 @@ class LabDataSet(pyasdf.ASDFDataSet):
             trc = self.waveforms["L0_" + stn][tag][trace_num].data
             fig.append_trace(
                 go.Scattergl(
-                    y=trc[view_from : view_from + view_len], line={"color": "black"}
+                    y=trc[start : stop], line={"color": "black"}
                 ),
                 int(plotkey[i][0]),
                 plotkey[i][1],
             )
             # plot existing picks, if any in window
-            if plot_op and old_picks[stn][0] > view_from:
+            if plot_op and old_picks[stn][0] > start:
                 fig.append_trace(
                     go.Scatter(
-                        x=np.array(old_picks[stn]) - view_from,
+                        x=np.array(old_picks[stn]) - start,
                         y=trc[old_picks[stn]],
                         mode="markers",
                         marker={"symbol": "x", "color": "blue", "size": 10},
@@ -228,10 +232,10 @@ class LabDataSet(pyasdf.ASDFDataSet):
                     plotkey[i][1],
                 )
             # plot new picks, if any in window
-            if new_picks[stn][0] > view_from:
+            if new_picks[stn][0] > start:
                 fig.append_trace(
                     go.Scatter(
-                        x=np.array(new_picks[stn]) - view_from,
+                        x=np.array(new_picks[stn]) - start,
                         y=trc[new_picks[stn]],
                         mode="markers+text",
                         text=[str(np) for np in range(len(new_picks[stn]))],
@@ -246,12 +250,13 @@ class LabDataSet(pyasdf.ASDFDataSet):
         print(f"Picks plot written to {figname}.html")
 
     def interactive_check_picks(
-        self, tag, trace_num, picks=None, view_from=180000, view_len=40000
+        self, tag, trace_num, picks=None, view_mid=180000, view_len=40000
     ):
         """Plot picks for all stations for one (tag,trcnum) and accept user adjustments.
-        Auto-picks if no picks are provided or already stored.
+        Auto-picks if no picks are provided or already stored (by noise, only appropriate for very clean signals).
         TODO: my notes imply that plotly is now interactive enough that I could replot after each input"""
         stns = self.stns  # TODO: is this necessary?
+        start = int(view_mid - view_len/2)
 
         # auto-pick if necessary
         try:
@@ -267,7 +272,7 @@ class LabDataSet(pyasdf.ASDFDataSet):
             else:
                 picks = old_picks
                 # TODO: there has to be better logic for this (still?)
-        self.plot_picks(tag, trace_num, view_from, view_len, picks)
+        self.plot_picks(tag, trace_num, view_mid, view_len, picks)
 
         # ask for inputs
         print(
@@ -282,33 +287,68 @@ class LabDataSet(pyasdf.ASDFDataSet):
             try:
                 chan = int(adjust[:2])
                 action = adjust[2]
-                num = int(adjust[3:])
+                rest = adjust[3:]
             except:
                 chan = int(adjust[0])
                 action = adjust[1]
-                num = int(adjust[2:])
+                rest = adjust[2:]
             # parse action
             if action == "s":
                 # select one correct pick
-                picks[stns[chan]] = [picks[stns[chan]][num]]
+                picks[stns[chan]] = [picks[stns[chan]][int(rest)]]
             elif action == "r":
                 # pick near somewhere else
                 trc = self.waveforms["L0_" + stns[chan]][tag][trace_num].data
+                # check for rl,rr specification TODO: prob a better way to parse input
+                rl,rr = [2000,2000]
+                try:
+                    num = int(rest)
+                except: # letters included in remaining part
+                    spec = re.split('(\D)',rest) # split on (and keep) letters
+                    num = int(spec.pop(0))
+                    while spec:
+                        lett = spec.pop(0)
+                        if lett == 'b':
+                            rl = spec.pop(0)
+                            rr = rl
+                        elif lett == 'r':
+                            rr = spec.pop(0)
+                        elif lett == 'l':
+                            rl = spec.pop(0)
+                        else:
+                            print("couldn't parse, no action")
+                            continue
                 picks[stns[chan]] = pick_near(
-                    trc, num + view_from, reach_left=2000, reach_right=2000, thr=0.9
+                    trc, num + start, reach_left=int(rl), reach_right=int(rr), thr=0.9
                 )
             elif action == "m":
                 # manually enter pick
+                num = int(rest)
                 if num == -1:
                     picks[stns[chan]] = [-1]
                 else:
-                    picks[stns[chan]] = [num + view_from]
+                    picks[stns[chan]] = [num + start]
             # move to next adjustment or exit
             adjust = input("Adjust a channel? - to exit: ")
 
         # add picks, catching and returning overwritten old_picks
         old_picks = self.add_picks(tag, trace_num, picks)
         return old_picks
+    
+    def pick_all_near(
+        self, tag, trace_num, near, reach_left=2000, reach_right=2000, thr=0.9
+    ):
+        """Run pick_near on all stations for one tag/trcnum at once. Return dict
+        of picks to run through interactive_check_picks."""
+        # no need to check for old picks now, add_picks will do that
+        # run pick_near for each stn
+        picks = {}
+        for i, stn in enumerate(self.stns):
+            trc = self.waveforms["L0_" + stn][tag][trace_num].data[near-reach_left:near+reach_right]
+            picks[stn] = pick_near(trc, reach_left, reach_left, reach_right, thr, AIC=[])
+            picks[stn] = [p+near-reach_left for p in picks[stn]]
+        
+        return picks
 
     ######## source location on object ########
     def locate_tag(self, tag, vp=0.272, bootstrap=False):
